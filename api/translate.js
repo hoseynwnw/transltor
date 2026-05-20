@@ -313,7 +313,7 @@ module.exports = async function (req, res) {
     try { if (req.headers['x-gas-urls']) gasUrls = JSON.parse(req.headers['x-gas-urls']); } catch(e){}
 
     if (gasUrls.length === 0) {
-      gasUrls = ['https://script.google.com/macros/s/AKfycbxUfXTjUQX6q1FiVjv5ZsNblPcOCbU_cJVO7BWXhctl1RX6Y5FA8xGvwPLnyVs5A_Q/exec'];
+      gasUrls = ['https://script.google.com/macros/s/AKfycbyy7UufdTZMeNFzhg-wAY_-IIfREV-5yhdJ2hphhrz9kXsLn4PTSY_7I8u4olWmh2gU/exec'];
     }
 
     // Vercel 負責解壓，避開 Worker CPU 消耗
