@@ -223,7 +223,8 @@ const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 let globalCircuitBroken = false;
 let currentGasIndex = 0;
 
-async function translateBatch(texts, targetLang, gasUrls) {
+// 【修改】加入 runCtx 參數來記錄配額
+async function translateBatch(texts, targetLang, gasUrls, runCtx) {
   const clean = texts.map(t => (t || '').replace(/\n/g, ' ').trim());
   if (globalCircuitBroken) return clean;
 
@@ -245,7 +246,11 @@ async function translateBatch(texts, targetLang, gasUrls) {
       const data = await r.json();
       if (data.error) throw new Error(data.error);
 
-      if (data.quota) console.log(`[GAS] 線路 ${myTryIndex} | 當前配額: ${data.quota} / 5000`);
+      // 保存最新的配額到上下文
+      if (data.quota) {
+          console.log(`[GAS] 線路 ${myTryIndex} | 當前配額: ${data.quota} / 5000`);
+          if (runCtx) runCtx.quota = data.quota;
+      }
 
       globalCircuitBroken = false;
       const translatedArray = data.translations || [];
@@ -266,7 +271,8 @@ async function translateBatch(texts, targetLang, gasUrls) {
   return clean;
 }
 
-async function translateAll(segments, targetLang, gasUrls) {
+// 【修改】加入 runCtx 參數傳遞
+async function translateAll(segments, targetLang, gasUrls, runCtx) {
   if (!segments || !segments.length) return { translations: [] };
   globalCircuitBroken = false;
   const BS = 50; const CC = 4;  
@@ -281,7 +287,7 @@ async function translateAll(segments, targetLang, gasUrls) {
       const i = index++;
       const batchTexts = batches[i].map(s => s.origText.replace(/\n/g, ' ').trim());
       if (i > 0 && !globalCircuitBroken) await sleep(200); 
-      results[i] = await translateBatch(batchTexts, targetLang, gasUrls);
+      results[i] = await translateBatch(batchTexts, targetLang, gasUrls, runCtx);
     }
   }
 
@@ -314,7 +320,8 @@ module.exports = async function (req, res) {
     const parsed = pbDecode(new Uint8Array(buffer));
     const segments = collectSegmentsGlobally(parsed);
 
-    let cacheStatus = "MISS_AND_TRANSLATED"; // 默認未命中快取
+    let cacheStatus = "MISS_AND_TRANSLATED"; 
+    let runCtx = { quota: null }; // 用來記錄這次運行的 GAS 配額
 
     if (segments.length > 0) {
       let finalTranslations = null;
@@ -336,25 +343,21 @@ module.exports = async function (req, res) {
 
       // 2. 若未命中則進行翻譯，並寫入快取
       if (!finalTranslations) {
-         const { translations } = await translateAll(segments, targetLang, gasUrls);
+         const { translations } = await translateAll(segments, targetLang, gasUrls, runCtx);
          finalTranslations = translations;
 
-         // 💡 優化：透過異步 IIFE，消耗完 Response 來避免 SocketError
+         // 💡 【核心修復】加入 await，強制 Vercel 等待快取寫入完畢，徹底消滅 SocketError
          if (reqToken && cfUrl && finalTranslations.length === segments.length) {
-            (async () => {
-               try {
-                 const wRes = await fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ translations: finalTranslations })
-                 });
-                 await wRes.text(); // 確保優雅關閉連線
-               } catch (e) {
-                 if (!e.message.includes('other side closed') && e.code !== 'UND_ERR_SOCKET') {
-                    console.error("Write Cache Error", e);
-                 }
-               }
-            })();
+             try {
+               const wRes = await fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ translations: finalTranslations })
+               });
+               await wRes.text(); 
+             } catch (e) {
+               console.error("Write Cache Error", e);
+             }
          }
       }
 
@@ -365,8 +368,12 @@ module.exports = async function (req, res) {
     let finalBuffer = Buffer.from(pbEncode(parsed));
     if (isGzip) finalBuffer = await gzip(finalBuffer);
 
-    // 透過 HTTP Header 將狀態傳回給 Cloudflare
+    // 💡 透過 HTTP Header 將狀態與配額傳回給 Cloudflare
     res.setHeader('X-Cache-Status', cacheStatus);
+    if (runCtx.quota) {
+        res.setHeader('X-GAS-Quota', runCtx.quota.toString());
+    }
+    
     res.setHeader('Content-Type', 'application/x-protobuf');
     res.status(200).send(finalBuffer);
 
