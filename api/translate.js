@@ -324,10 +324,12 @@ module.exports = async function (req, res) {
     const parsed = pbDecode(new Uint8Array(buffer));
     const segments = collectSegmentsGlobally(parsed);
 
+   let cacheStatus = "MISS_AND_TRANSLATED"; // 默认为未命中，调用了翻译
+
     if (segments.length > 0) {
       let finalTranslations = null;
 
-      // 💡 1. 嘗試向 CF Worker 數據庫讀取「純文本快取」
+      // 1. 尝试读取 CF 缓存
       if (reqToken && cfUrl) {
          try {
             const cacheResp = await fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`);
@@ -335,18 +337,18 @@ module.exports = async function (req, res) {
                const data = await cacheResp.json();
                if (data.translations && data.translations.length === segments.length) {
                   finalTranslations = data.translations;
-                  console.log("✅ Vercel 命中 CF 邊緣純文本快取，跳過 GAS 翻譯");
+                  cacheStatus = "HIT_EDGE_CACHE"; // 标记：成功命中缓存！
                }
             }
-         } catch(e) { console.error("Read Cache Error", e); }
+         } catch(e) { }
       }
 
-      // 💡 2. 未命中快取，呼叫 GAS 進行重度翻譯
+      // 2. 未命中，调用 GAS 翻译
       if (!finalTranslations) {
          const { translations } = await translateAll(segments, targetLang, gasUrls);
          finalTranslations = translations;
 
-         // 💡 3. 翻譯成功後，非阻塞地通知 CF Worker 把「純文本」存起來
+         // 3. 写入缓存
          if (reqToken && cfUrl && finalTranslations.length === segments.length) {
             fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`, {
                method: 'POST',
@@ -356,16 +358,18 @@ module.exports = async function (req, res) {
          }
       }
 
-      // 💡 4. 無論是讀快取還是剛翻譯完，都將純文本注入到「最新鮮的 Protobuf」中
       injectTranslationsGlobally(parsed, finalTranslations, { idx: 0 }, targetLang);
     }
 
     let finalBuffer = Buffer.from(pbEncode(parsed));
     if (isGzip) finalBuffer = await gzip(finalBuffer);
 
+    // 【新增这行】把状态通过 Header 传给 Cloudflare
+    res.setHeader('X-Cache-Status', cacheStatus);
     res.setHeader('Content-Type', 'application/x-protobuf');
     res.status(200).send(finalBuffer);
 
+    
   } catch (error) {
     console.error("Vercel Error:", error);
     res.status(500).json({ error: error.message });
