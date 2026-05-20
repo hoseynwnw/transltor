@@ -312,8 +312,13 @@ module.exports = async function (req, res) {
     let gasUrls = [];
     try { if (req.headers['x-gas-urls']) gasUrls = JSON.parse(req.headers['x-gas-urls']); } catch(e){}
 
-    if (gasUrls.length === 0) {
-      gasUrls = ['https://script.google.com/macros/s/AKfycbyy7UufdTZMeNFzhg-wAY_-IIfREV-5yhdJ2hphhrz9kXsLn4PTSY_7I8u4olWmh2gU/exec'];
+   if (gasUrls.length === 0) {
+      // 通过 process.env 读取 Vercel 后台配置的变量
+      if (process.env.SECRET_GAS_URL) {
+        gasUrls = [process.env.SECRET_GAS_URL];
+      } else {
+        console.warn("未找到环境变量 SECRET_GAS_URL");
+      }
     }
 
     // Vercel 負責解壓，避開 Worker CPU 消耗
