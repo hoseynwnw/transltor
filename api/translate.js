@@ -320,7 +320,7 @@ module.exports = async function (req, res) {
     const parsed = pbDecode(new Uint8Array(buffer));
     const segments = collectSegmentsGlobally(parsed);
 
-    let cacheStatus = "MISS_AND_TRANSLATED"; 
+    let cacheStatus = "💦 呜呜，记忆库空空如也 (QAQ)... 没摸到缓存，正在疯狂现烤翻译中！✍️✨"; 
     let runCtx = { quota: null }; // 用來記錄這次運行的 GAS 配額
 
     if (segments.length > 0) {
