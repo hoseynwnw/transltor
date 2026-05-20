@@ -200,7 +200,7 @@ function injectTranslationsGlobally(obj, translations, state = { idx: 0 }, targe
 
     const rtlLangs = ['ar', 'he', 'fa', 'ur']; 
     const isRtl = rtlLangs.some(l => targetLang.startsWith(l));
-    let appendStr = isRtl ? `\n${zh}` : `\n\u3000${zh}`;
+    let appendStr = isRtl ? `\n${zh}` : `\n\u3000\u3000${zh}`;
 
     hackTextAndLength(obj, appendStr, extracted.type);
     obj.__dirty = true;
