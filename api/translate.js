@@ -1,13 +1,9 @@
-// api/translate.js
 const zlib = require('zlib');
 const util = require('util');
 const gunzip = util.promisify(zlib.gunzip);
 const gzip = util.promisify(zlib.gzip);
 
-// 禁用 Vercel 默认的 body 解析，我们需要原始的 Protobuf 字节流
-const config = {
-  api: { bodyParser: false },
-};
+const config = { api: { bodyParser: false } };
 
 function varintSize(v) { v = v >>> 0; let s = 0; do { s++; v >>>= 7; } while (v > 0); return s; }
 function writeVarint(buf, offset, value) { let v = value >>> 0; while (v > 0x7f) { buf[offset++] = (v & 0x7f) | 0x80; v >>>= 7; } buf[offset] = v; }
@@ -152,9 +148,7 @@ function replaceDeepText(obj, appendStr) {
     if (key === '__dirty') continue;
     for (const item of (Array.isArray(val) ? val : [val])) {
       if (item && item.t === 'msg') {
-        if (replaceDeepText(item.v, appendStr)) {
-          item.dirty = true; obj.__dirty = true; return true;
-        }
+        if (replaceDeepText(item.v, appendStr)) { item.dirty = true; obj.__dirty = true; return true; }
       }
     }
   }
@@ -241,7 +235,6 @@ async function translateBatch(texts, targetLang, gasUrls) {
     if (!gasUrl) return clean;
     
     try {
-      // Vercel Node 18+ 原生支援 fetch，且無超時硬限制
       const r = await fetch(gasUrl, { 
         method: 'POST', 
         headers: { 'Content-Type': 'application/json' }, 
@@ -297,8 +290,6 @@ async function translateAll(segments, targetLang, gasUrls) {
   return { translations: results.flat() };
 }
 
-// ... (保留文件上方原本的 pbDecode, pbEncode, translateAll 等基礎代碼) ...
-
 module.exports = async function (req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
@@ -313,23 +304,22 @@ module.exports = async function (req, res) {
     const cfUrl = req.headers['x-cf-url'];
     
     let gasUrls = [];
-    try { 
-      if (process.env.SECRET_GAS_URL) gasUrls = [process.env.SECRET_GAS_URL];
-      else if (req.headers['x-gas-urls']) gasUrls = JSON.parse(req.headers['x-gas-urls']); 
-    } catch(e){}
-
-    if (gasUrls.length === 0) gasUrls = ['https://script.google.com/macros/s/AKfycbxUfXTjUQX6q1FiVjv5ZsNblPcOCbU_cJVO7BWXhctl1RX6Y5FA8xGvwPLnyVs5A_Q/exec'];
+    if (process.env.SECRET_GAS_URL) {
+      gasUrls = [process.env.SECRET_GAS_URL];
+    } else {
+      gasUrls = ['https://script.google.com/macros/s/AKfycbxUfXTjUQX6q1FiVjv5ZsNblPcOCbU_cJVO7BWXhctl1RX6Y5FA8xGvwPLnyVs5A_Q/exec'];
+    }
 
     if (isGzip) buffer = await gunzip(buffer);
     const parsed = pbDecode(new Uint8Array(buffer));
     const segments = collectSegmentsGlobally(parsed);
 
-   let cacheStatus = "MISS_AND_TRANSLATED"; // 默认为未命中，调用了翻译
+    let cacheStatus = "MISS_AND_TRANSLATED"; // 默認未命中快取
 
     if (segments.length > 0) {
       let finalTranslations = null;
 
-      // 1. 尝试读取 CF 缓存
+      // 1. 讀取 CF 快取
       if (reqToken && cfUrl) {
          try {
             const cacheResp = await fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`);
@@ -337,39 +327,49 @@ module.exports = async function (req, res) {
                const data = await cacheResp.json();
                if (data.translations && data.translations.length === segments.length) {
                   finalTranslations = data.translations;
-                  cacheStatus = "HIT_EDGE_CACHE"; // 标记：成功命中缓存！
+                  cacheStatus = "HIT_EDGE_CACHE"; // 命中快取！
+                  console.log("✅ Vercel 命中 CF 邊緣純文本快取，跳過 GAS 翻譯");
                }
             }
          } catch(e) { }
       }
 
-      // 2. 未命中，调用 GAS 翻译
+      // 2. 若未命中則進行翻譯，並寫入快取
       if (!finalTranslations) {
          const { translations } = await translateAll(segments, targetLang, gasUrls);
          finalTranslations = translations;
 
-         // 3. 写入缓存
+         // 💡 優化：透過異步 IIFE，消耗完 Response 來避免 SocketError
          if (reqToken && cfUrl && finalTranslations.length === segments.length) {
-            fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`, {
-               method: 'POST',
-               headers: { 'Content-Type': 'application/json' },
-               body: JSON.stringify({ translations: finalTranslations })
-            }).catch(e => console.error("Write Cache Error", e));
+            (async () => {
+               try {
+                 const wRes = await fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ translations: finalTranslations })
+                 });
+                 await wRes.text(); // 確保優雅關閉連線
+               } catch (e) {
+                 if (!e.message.includes('other side closed') && e.code !== 'UND_ERR_SOCKET') {
+                    console.error("Write Cache Error", e);
+                 }
+               }
+            })();
          }
       }
 
+      // 3. 寫入新鮮的 Protobuf
       injectTranslationsGlobally(parsed, finalTranslations, { idx: 0 }, targetLang);
     }
 
     let finalBuffer = Buffer.from(pbEncode(parsed));
     if (isGzip) finalBuffer = await gzip(finalBuffer);
 
-    // 【新增这行】把状态通过 Header 传给 Cloudflare
+    // 透過 HTTP Header 將狀態傳回給 Cloudflare
     res.setHeader('X-Cache-Status', cacheStatus);
     res.setHeader('Content-Type', 'application/x-protobuf');
     res.status(200).send(finalBuffer);
 
-    
   } catch (error) {
     console.error("Vercel Error:", error);
     res.status(500).json({ error: error.message });
