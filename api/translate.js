@@ -297,46 +297,70 @@ async function translateAll(segments, targetLang, gasUrls) {
   return { translations: results.flat() };
 }
 
+// ... (保留文件上方原本的 pbDecode, pbEncode, translateAll 等基礎代碼) ...
+
 module.exports = async function (req, res) {
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   try {
-    // 讀取 Worker 傳過來的原始字節流
     const chunks = [];
     for await (const chunk of req) chunks.push(chunk);
     let buffer = Buffer.concat(chunks);
 
-    // 接收 Worker 傳遞的參數
     const targetLang = req.headers['x-target-lang'] || 'zh-CN,fa';
     const isGzip = req.headers['x-is-gzip'] === 'true';
+    const reqToken = req.headers['x-req-token'];
+    const cfUrl = req.headers['x-cf-url'];
+    
     let gasUrls = [];
-    try { if (req.headers['x-gas-urls']) gasUrls = JSON.parse(req.headers['x-gas-urls']); } catch(e){}
+    try { 
+      if (process.env.SECRET_GAS_URL) gasUrls = [process.env.SECRET_GAS_URL];
+      else if (req.headers['x-gas-urls']) gasUrls = JSON.parse(req.headers['x-gas-urls']); 
+    } catch(e){}
 
-   if (gasUrls.length === 0) {
-      // 通过 process.env 读取 Vercel 后台配置的变量
-      if (process.env.SECRET_GAS_URL) {
-        gasUrls = [process.env.SECRET_GAS_URL];
-      } else {
-        console.warn("未找到环境变量 SECRET_GAS_URL");
-      }
-    }
+    if (gasUrls.length === 0) gasUrls = ['https://script.google.com/macros/s/AKfycbxUfXTjUQX6q1FiVjv5ZsNblPcOCbU_cJVO7BWXhctl1RX6Y5FA8xGvwPLnyVs5A_Q/exec'];
 
-    // Vercel 負責解壓，避開 Worker CPU 消耗
     if (isGzip) buffer = await gunzip(buffer);
-
-    const bytesArray = new Uint8Array(buffer);
-    const parsed = pbDecode(bytesArray);
+    const parsed = pbDecode(new Uint8Array(buffer));
     const segments = collectSegmentsGlobally(parsed);
 
     if (segments.length > 0) {
-      const { translations } = await translateAll(segments, targetLang, gasUrls);
-      injectTranslationsGlobally(parsed, translations, { idx: 0 }, targetLang);
+      let finalTranslations = null;
+
+      // 💡 1. 嘗試向 CF Worker 數據庫讀取「純文本快取」
+      if (reqToken && cfUrl) {
+         try {
+            const cacheResp = await fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`);
+            if (cacheResp.ok) {
+               const data = await cacheResp.json();
+               if (data.translations && data.translations.length === segments.length) {
+                  finalTranslations = data.translations;
+                  console.log("✅ Vercel 命中 CF 邊緣純文本快取，跳過 GAS 翻譯");
+               }
+            }
+         } catch(e) { console.error("Read Cache Error", e); }
+      }
+
+      // 💡 2. 未命中快取，呼叫 GAS 進行重度翻譯
+      if (!finalTranslations) {
+         const { translations } = await translateAll(segments, targetLang, gasUrls);
+         finalTranslations = translations;
+
+         // 💡 3. 翻譯成功後，非阻塞地通知 CF Worker 把「純文本」存起來
+         if (reqToken && cfUrl && finalTranslations.length === segments.length) {
+            fetch(`${cfUrl}/api/cache?token=${reqToken}&lang=${targetLang}`, {
+               method: 'POST',
+               headers: { 'Content-Type': 'application/json' },
+               body: JSON.stringify({ translations: finalTranslations })
+            }).catch(e => console.error("Write Cache Error", e));
+         }
+      }
+
+      // 💡 4. 無論是讀快取還是剛翻譯完，都將純文本注入到「最新鮮的 Protobuf」中
+      injectTranslationsGlobally(parsed, finalTranslations, { idx: 0 }, targetLang);
     }
 
-    const rebuilt = pbEncode(parsed);
-    let finalBuffer = Buffer.from(rebuilt);
-
-    // Vercel 負責重新壓縮
+    let finalBuffer = Buffer.from(pbEncode(parsed));
     if (isGzip) finalBuffer = await gzip(finalBuffer);
 
     res.setHeader('Content-Type', 'application/x-protobuf');
